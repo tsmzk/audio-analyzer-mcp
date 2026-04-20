@@ -128,6 +128,8 @@ async def analyze_youtube_audio(
                 sample_rate=params.sample_rate,
                 hop_length=params.hop_length,
                 frame_length=params.frame_length,
+                start_sec=params.start_sec,
+                end_sec=params.end_sec,
                 progress_cb=cb,
             )
 
@@ -177,6 +179,8 @@ async def analyze_local_audio_tool(
                 sample_rate=params.sample_rate,
                 hop_length=params.hop_length,
                 frame_length=params.frame_length,
+                start_sec=params.start_sec,
+                end_sec=params.end_sec,
                 progress_cb=cb,
             )
 
@@ -227,6 +231,8 @@ async def detect_highlights(
                 sample_rate=params.sample_rate,
                 hop_length=params.hop_length,
                 frame_length=params.frame_length,
+                start_sec=params.start_sec,
+                end_sec=params.end_sec,
                 progress_cb=cb,
             )
 

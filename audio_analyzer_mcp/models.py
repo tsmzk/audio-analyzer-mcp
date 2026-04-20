@@ -7,6 +7,8 @@ lowercased format, etc.).
 
 from __future__ import annotations
 
+from typing import Optional
+
 # Pydantic は「入力データの型と制約をクラスで宣言 → 受け取った値を自動検証」してくれるライブラリ。
 # 手書きで `if not isinstance(x, int): raise ...` を書かずに済むのが利点。
 #   BaseModel       : 全モデルが継承する親クラス
@@ -22,8 +24,16 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from audio_analyzer_mcp.constants import (
     FRAME_LENGTH as DEFAULT_FRAME_LENGTH,
     HOP_LENGTH as DEFAULT_HOP_LENGTH,
+    NYQUIST_SAFETY,
+    PITCH_FMAX_HZ,
     SAMPLE_RATE as DEFAULT_SAMPLE_RATE,
 )
+
+# ピッチ探索(pyin)で fmax=PITCH_FMAX_HZ を確保するための最小サンプルレート。
+# Nyquist 余裕 NYQUIST_SAFETY を掛けて、切り上げ整数に。
+# 例: 2093Hz * 2.1 ≈ 4395 → ge=4400 を採用。
+MIN_SAMPLE_RATE = int(PITCH_FMAX_HZ * NYQUIST_SAFETY) + 5
+MIN_SAMPLE_RATE = ((MIN_SAMPLE_RATE + 99) // 100) * 100  # 100Hz 単位に丸め
 
 
 def _validate_frame_vs_hop(frame_length: int, hop_length: int) -> None:
@@ -33,54 +43,48 @@ def _validate_frame_vs_hop(frame_length: int, hop_length: int) -> None:
     (e.g. ParameterError: Target size must be at least input size). Reject here
     with a clearer message.
     """
-    # frame_length(窓の幅)が hop_length(ずらし幅)より小さいと、
-    # librosa 内部のリサンプリングがわかりにくいエラーで落ちる。
-    # ここで先に弾いて、ユーザーに親切なメッセージを返す。
     if frame_length < hop_length:
-        # `raise` で例外を発生させる。Pydantic が拾って「入力エラー」として返してくれる。
         raise ValueError(
             f"frame_length ({frame_length}) must be >= hop_length ({hop_length}). "
             "Typical values: frame_length=4096, hop_length=2048."
         )
 
 
+def _validate_time_range(start_sec: Optional[float], end_sec: Optional[float]) -> None:
+    """start_sec / end_sec が両方指定された場合の前後関係をチェック。"""
+    if start_sec is not None and start_sec < 0:
+        raise ValueError(f"start_sec ({start_sec}) must be >= 0.")
+    if end_sec is not None and end_sec <= 0:
+        raise ValueError(f"end_sec ({end_sec}) must be > 0.")
+    if start_sec is not None and end_sec is not None and end_sec <= start_sec:
+        raise ValueError(
+            f"end_sec ({end_sec}) must be greater than start_sec ({start_sec})."
+        )
+
+
 # ------------------------------------------------------------------
 # YouTube音声解析ツールの入力モデル
 # ------------------------------------------------------------------
-#
-# 書き方の流れ:
-#   1. `class XxxInput(BaseModel):` で Pydanticモデルを宣言
-#   2. `model_config` でモデル全体の挙動を設定
-#   3. 各フィールドを `name: 型 = Field(...)` で宣言
-#   4. 必要なら `@field_validator` / `@model_validator` で追加検証
-#
-# 型の書き方: `youtube_url: str` は「このフィールドは文字列型」の意。
 class AnalyzeYouTubeAudioInput(BaseModel):
     """Input for analyzing audio from a YouTube video."""
 
-    # モデル全体の設定。
-    #   str_strip_whitespace=True : 文字列の前後空白を自動で除去
-    #   validate_assignment=True  : 後から属性を書き換えたときも検証する
-    #   extra="forbid"            : 未定義のフィールドが来たらエラー(タイプミス防止)
     model_config = ConfigDict(
         str_strip_whitespace=True,
         validate_assignment=True,
         extra="forbid",
     )
 
-    # `Field(...)` の最初の `...`(Ellipsis)は「必須フィールド」の意味。
-    # デフォルト値がない = 呼び出し元は必ず指定しないといけない。
     youtube_url: str = Field(
         ...,
         description=(
             "Public YouTube video URL. "
             "Formats: https://www.youtube.com/watch?v=XXXXX or https://youtu.be/XXXXX"
         ),
-        min_length=10,   # 10文字未満はURLとしてあり得ない
-        max_length=500,  # 500文字超は明らかにおかしい(攻撃対策も兼ねる)
+        min_length=10,
+        max_length=500,
     )
     format: str = Field(
-        default="csv",  # 省略時は "csv"
+        default="csv",
         description=(
             "Output format: 'csv' (1 row per second, good for data processing) "
             "or 'json' (structured, good for programmatic use). Default: csv"
@@ -90,10 +94,12 @@ class AnalyzeYouTubeAudioInput(BaseModel):
         default=DEFAULT_SAMPLE_RATE,
         description=(
             f"Sample rate in Hz. Lower = faster but less precise pitch. "
-            f"Default: {DEFAULT_SAMPLE_RATE}. Use 22050 for max quality, 8000 for speed."
+            f"Default: {DEFAULT_SAMPLE_RATE}. "
+            f"Minimum {MIN_SAMPLE_RATE}Hz is required so the Nyquist frequency "
+            f"stays above the pitch detector's fmax ({int(PITCH_FMAX_HZ)}Hz). "
+            "Use 22050 for max quality, 8000 for speed."
         ),
-        # ge = "greater than or equal" (以上), le = "less than or equal" (以下)
-        ge=4000,
+        ge=MIN_SAMPLE_RATE,
         le=44100,
     )
     hop_length: int = Field(
@@ -113,32 +119,41 @@ class AnalyzeYouTubeAudioInput(BaseModel):
         ge=512,
         le=16384,
     )
+    start_sec: Optional[float] = Field(
+        default=None,
+        description=(
+            "Optional. Start of the analysis range in seconds. "
+            "If omitted, analysis starts from the beginning. "
+            "Combine with end_sec to analyze a specific segment of a long video."
+        ),
+        ge=0.0,
+    )
+    end_sec: Optional[float] = Field(
+        default=None,
+        description=(
+            "Optional. End of the analysis range in seconds. "
+            "If omitted, analysis goes through the end of the file."
+        ),
+        gt=0.0,
+    )
 
-    # `@field_validator("format")` は「formatフィールドの検証関数です」という印(デコレータ)。
-    # `@classmethod` はインスタンスではなくクラスそのものを第1引数に受け取る関数の印。
-    # Pydantic の慣例で、field_validator は classmethod として定義する。
     @field_validator("format")
     @classmethod
     def validate_format(cls, v: str) -> str:
-        # 入力を小文字化・前後空白除去してから比較。"JSON" や "Csv" も受け入れる。
         if v.lower().strip() not in ("csv", "json"):
             raise ValueError("format must be 'csv' or 'json'")
-        # 返した値がそのままフィールドに入る(正規化後の値を保存できる)。
         return v.lower().strip()
 
-    # model_validator(mode="after"): 全フィールドの型検証が終わった後に走る。
-    # フィールド同士の関係を検証するときに使う(ここでは frame と hop の関係)。
     @model_validator(mode="after")
-    def validate_frame_hop(self) -> "AnalyzeYouTubeAudioInput":
+    def validate_cross_fields(self) -> "AnalyzeYouTubeAudioInput":
         _validate_frame_vs_hop(self.frame_length, self.hop_length)
-        # after mode では自分自身を return する約束。
+        _validate_time_range(self.start_sec, self.end_sec)
         return self
 
 
 # ------------------------------------------------------------------
 # ローカルファイル解析ツールの入力モデル
 # ------------------------------------------------------------------
-# 構造はほぼ YouTube用と同じ。違いは youtube_url → file_path のみ。
 class AnalyzeLocalAudioInput(BaseModel):
     """Input for analyzing a local audio/video file."""
 
@@ -163,8 +178,11 @@ class AnalyzeLocalAudioInput(BaseModel):
     )
     sample_rate: int = Field(
         default=DEFAULT_SAMPLE_RATE,
-        description=f"Sample rate in Hz. Default: {DEFAULT_SAMPLE_RATE}.",
-        ge=4000, le=44100,
+        description=(
+            f"Sample rate in Hz. Default: {DEFAULT_SAMPLE_RATE}. "
+            f"Minimum {MIN_SAMPLE_RATE}Hz (Nyquist >= pitch fmax)."
+        ),
+        ge=MIN_SAMPLE_RATE, le=44100,
     )
     hop_length: int = Field(
         default=DEFAULT_HOP_LENGTH,
@@ -176,6 +194,20 @@ class AnalyzeLocalAudioInput(BaseModel):
         description=f"Frame length in samples. Default: {DEFAULT_FRAME_LENGTH}.",
         ge=512, le=16384,
     )
+    start_sec: Optional[float] = Field(
+        default=None,
+        description=(
+            "Optional. Start of the analysis range in seconds. Default: from beginning."
+        ),
+        ge=0.0,
+    )
+    end_sec: Optional[float] = Field(
+        default=None,
+        description=(
+            "Optional. End of the analysis range in seconds. Default: to end of file."
+        ),
+        gt=0.0,
+    )
 
     @field_validator("format")
     @classmethod
@@ -185,8 +217,9 @@ class AnalyzeLocalAudioInput(BaseModel):
         return v.lower().strip()
 
     @model_validator(mode="after")
-    def validate_frame_hop(self) -> "AnalyzeLocalAudioInput":
+    def validate_cross_fields(self) -> "AnalyzeLocalAudioInput":
         _validate_frame_vs_hop(self.frame_length, self.hop_length)
+        _validate_time_range(self.start_sec, self.end_sec)
         return self
 
 
@@ -208,9 +241,8 @@ class DetectHighlightsInput(BaseModel):
         min_length=10,
         max_length=500,
     )
-    # ハイライト固有のパラメータ ↓
     top_n: int = Field(
-        default=20,  # 省略時は上位20件返す
+        default=20,
         description=(
             "Maximum number of highlight moments to return. Default: 20. "
             "Highlights are ranked by volume spike intensity."
@@ -219,7 +251,7 @@ class DetectHighlightsInput(BaseModel):
         le=100,
     )
     min_gap_sec: int = Field(
-        default=10,  # 近接したスパイクを1件にまとめるための最小間隔(秒)
+        default=10,
         description=(
             "Minimum gap in seconds between reported highlights. "
             "Prevents clustering of nearby spikes. Default: 10"
@@ -227,11 +259,13 @@ class DetectHighlightsInput(BaseModel):
         ge=1,
         le=300,
     )
-    # 以下は他モデルと共通の解析パラメータ
     sample_rate: int = Field(
         default=DEFAULT_SAMPLE_RATE,
-        description=f"Sample rate in Hz. Default: {DEFAULT_SAMPLE_RATE}.",
-        ge=4000, le=44100,
+        description=(
+            f"Sample rate in Hz. Default: {DEFAULT_SAMPLE_RATE}. "
+            f"Minimum {MIN_SAMPLE_RATE}Hz (Nyquist >= pitch fmax)."
+        ),
+        ge=MIN_SAMPLE_RATE, le=44100,
     )
     hop_length: int = Field(
         default=DEFAULT_HOP_LENGTH,
@@ -243,8 +277,23 @@ class DetectHighlightsInput(BaseModel):
         description=f"Frame length in samples. Default: {DEFAULT_FRAME_LENGTH}.",
         ge=512, le=16384,
     )
+    start_sec: Optional[float] = Field(
+        default=None,
+        description=(
+            "Optional. Start of the analysis range in seconds. Default: from beginning."
+        ),
+        ge=0.0,
+    )
+    end_sec: Optional[float] = Field(
+        default=None,
+        description=(
+            "Optional. End of the analysis range in seconds. Default: to end of file."
+        ),
+        gt=0.0,
+    )
 
     @model_validator(mode="after")
-    def validate_frame_hop(self) -> "DetectHighlightsInput":
+    def validate_cross_fields(self) -> "DetectHighlightsInput":
         _validate_frame_vs_hop(self.frame_length, self.hop_length)
+        _validate_time_range(self.start_sec, self.end_sec)
         return self

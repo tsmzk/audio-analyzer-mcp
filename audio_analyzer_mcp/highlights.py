@@ -53,6 +53,13 @@ def _detect_highlight_moments(
     # `A if 条件 else B` は三項演算子(条件分岐式)。
     pitch_p90 = float(np.percentile(pitch_values, 90)) if pitch_values else 200.0
 
+    # スペクトル重心のパーセンタイルもループ外で1度だけ計算する。
+    # centroid_p90 が None のときは「重心による加点はしない」ことを表す。
+    centroid_values = [f.spectral_centroid for f in speech_frames if f.spectral_centroid > 0]
+    centroid_p90: float | None = (
+        float(np.percentile(centroid_values, 90)) if centroid_values else None
+    )
+
     # ── 3. 各フレームを採点 ──
     for frame in frames:
         # 非発話フレームは採点対象外(BGMだけで盛り上げ判定しないため)。
@@ -83,16 +90,9 @@ def _detect_highlight_moments(
             reasons.append("high_pitch")
 
         # (d) 声の鋭さ(スペクトル重心が高い = ツッコミ・叫び) = +10点
-        #
-        # NOTE: centroid_p90 の計算がループ内にあるのは少し無駄
-        # (毎フレーム同じ値を再計算している)。
-        # 改善の余地だが、動作には影響しないので今は放置。
-        centroid_values = [f.spectral_centroid for f in speech_frames if f.spectral_centroid > 0]
-        if centroid_values:
-            centroid_p90 = float(np.percentile(centroid_values, 90))
-            if frame.spectral_centroid >= centroid_p90:
-                score += 10.0
-                reasons.append("sharp_voice")
+        if centroid_p90 is not None and frame.spectral_centroid >= centroid_p90:
+            score += 10.0
+            reasons.append("sharp_voice")
 
         # 0点のフレームは候補に入れない(該当理由なし)。
         if score > 0:
