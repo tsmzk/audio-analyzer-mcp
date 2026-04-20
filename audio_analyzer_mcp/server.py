@@ -9,13 +9,29 @@ Tools:
     detect_highlights      — Find volume spikes and high-energy moments (shortcut for short-form video selection)
 """
 
+# ------------------------------------------------------------------
+# このファイルの役割
+# ------------------------------------------------------------------
+# MCP(Model Context Protocol)は「AIアシスタント(Claudeなど)に外部ツールを
+# 提供する仕組み」。このファイルは以下を担当する:
+#   1. MCPサーバーのインスタンス作成
+#   2. 3つのツール(MCPクライアントから呼べる関数)の定義
+#   3. エントリーポイント(サーバー起動)
+#
+# 具体的な処理(ダウンロード、解析、ハイライト検出、進捗通知…)は
+# 他のモジュールに委譲し、ここでは「ツールの外形」だけ定義する。
+# ------------------------------------------------------------------
+
 from __future__ import annotations
 
 import json
 import logging
+# sys.stderr: 標準エラー出力。MCPはstdoutを通信に使うので、ログはstderrに出す。
 import sys
 from typing import Callable
 
+# FastMCP: MCPサーバーを簡単に作るためのフレームワーク。
+# Context: 各ツール呼び出しごとのコンテキスト(進捗報告・ログ送信などの手段を持つ)。
 from mcp.server.fastmcp import Context, FastMCP
 
 from audio_analyzer_mcp.analyzer import analyze_local, analyze_youtube
@@ -29,9 +45,12 @@ from audio_analyzer_mcp.models import (
 from audio_analyzer_mcp.progress import _run_with_heartbeat
 
 # ------------------------------------------------------------------
-# Logging
+# ロギング設定
 # ------------------------------------------------------------------
-
+# basicConfig はプロセス全体のログ設定。
+#   level=INFO        : INFO以上のログを出す(DEBUGは出さない)
+#   format=...        : ログの見た目フォーマット
+#   stream=sys.stderr : 標準エラーに出す(stdoutはMCP通信に使うため避ける)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -40,15 +59,30 @@ logging.basicConfig(
 logger = logging.getLogger("audio_analyzer_mcp")
 
 # ------------------------------------------------------------------
-# Server instance
+# サーバーインスタンス
 # ------------------------------------------------------------------
 
+# FastMCP("名前") でサーバーを1つ作る。
+# この `mcp` オブジェクトを通して、下で @mcp.tool デコレータでツールを登録する。
 mcp = FastMCP("audio_analyzer_mcp")
 
 
 # ------------------------------------------------------------------
-# Tools
+# ツール定義
 # ------------------------------------------------------------------
+#
+# @mcp.tool(...) デコレータ:
+#   関数を「MCPツールとして登録」する印。
+#   annotations はツールのメタ情報で、
+#     readOnlyHint   : 読み取り専用(副作用なし)
+#     destructiveHint: 破壊的操作か(削除等)
+#     idempotentHint : 冪等か(同じ入力→同じ出力、副作用同じ)
+#     openWorldHint  : 外部世界(インターネット等)にアクセスするか
+#
+# 関数シグネチャ(params, ctx):
+#   params : Pydanticモデル(models.py で定義)。入力は自動バリデーションされる
+#   ctx    : Context。進捗報告・ログ送信に使う
+#   戻り値 : 文字列(CSV や JSON)。MCPクライアントに返される
 
 
 @mcp.tool(
@@ -58,7 +92,7 @@ mcp = FastMCP("audio_analyzer_mcp")
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
-        "openWorldHint": True,
+        "openWorldHint": True,  # YouTubeにアクセスするのでTrue
     },
 )
 async def analyze_youtube_audio(
@@ -85,6 +119,9 @@ async def analyze_youtube_audio(
         CSV or JSON string with per-second audio analysis.
     """
     try:
+        # 内側関数 _runner を定義して _run_with_heartbeat に渡すパターン。
+        # _runner は「進捗コールバック cb を受け取って analyze_youtube を呼ぶ」だけの関数。
+        # こうすることで、別スレッドから進捗通知を流せる(progress.py 参照)。
         def _runner(cb: Callable[[str, float], None]):
             return analyze_youtube(
                 params.youtube_url,
@@ -94,9 +131,13 @@ async def analyze_youtube_audio(
                 progress_cb=cb,
             )
 
+        # `await` で重い処理の完了を待つ(裏ではハートビートが流れている)。
         frames = await _run_with_heartbeat(ctx, _runner)
+        # 結果を CSV/JSON 文字列に整形して返す。
         return _format_frames(frames, params.format)
     except Exception as exc:
+        # どの例外でもユーザー向けメッセージに変換して返す。
+        # ここで「ログには詳細を、ユーザーには親切な文章を」と役割分担している。
         logger.error("analyze_youtube_audio failed: %s", exc, exc_info=True)
         return _format_error(exc)
 
@@ -128,6 +169,7 @@ async def analyze_local_audio_tool(
     Returns:
         CSV or JSON string with per-second audio analysis.
     """
+    # ↑の analyze_youtube_audio とほぼ同じ構造。違いは analyze_local を呼ぶだけ。
     try:
         def _runner(cb: Callable[[str, float], None]):
             return analyze_local(
@@ -178,6 +220,7 @@ async def detect_highlights(
         JSON array of highlight moments with scores.
     """
     try:
+        # 1. まず解析 → 2. ハイライト抽出 → 3. サマリーと一緒にJSONで返す、という流れ。
         def _runner(cb: Callable[[str, float], None]):
             return analyze_youtube(
                 params.youtube_url,
@@ -188,21 +231,25 @@ async def detect_highlights(
             )
 
         frames = await _run_with_heartbeat(ctx, _runner)
+
+        # ハイライト検出(スコア付き上位リストを得る)。
         highlights = _detect_highlight_moments(
             frames,
             top_n=params.top_n,
             min_gap_sec=params.min_gap_sec,
         )
 
-        # Add summary stats
+        # ── 動画全体のサマリー統計を作る ──
         speech_frames = [f for f in frames if f.is_speech]
         summary = {
-            "total_duration_sec": len(frames),
-            "speech_seconds": len(speech_frames),
+            "total_duration_sec": len(frames),              # 動画全体の長さ(秒)
+            "speech_seconds": len(speech_frames),            # 発話してた秒数
             "silence_seconds": len(frames) - len(speech_frames),
+            # sum(1 for ... if ...) は「条件を満たす要素の数」を数える慣用句
             "total_volume_spikes": sum(1 for f in frames if f.volume_spike),
             "highlights": highlights,
         }
+        # indent=2 で人間が読みやすく整形。ensure_ascii=False で日本語もそのまま出力。
         return json.dumps(summary, ensure_ascii=False, indent=2)
     except Exception as exc:
         logger.error("detect_highlights failed: %s", exc, exc_info=True)
@@ -210,14 +257,20 @@ async def detect_highlights(
 
 
 # ------------------------------------------------------------------
-# Entry point
+# エントリーポイント
 # ------------------------------------------------------------------
 
 
 def main() -> None:
-    """Run the MCP server with stdio transport."""
+    """MCPサーバーを stdio transport で起動する。
+
+    stdio transport: 標準入出力(stdin/stdout)でMCPクライアントと通信するモード。
+    Claude Desktop などローカルMCPクライアントはこの方式で接続してくる。
+    """
     mcp.run()
 
 
+# `if __name__ == "__main__":` は「このファイルが直接実行された時だけ走る」のお約束。
+# 他のモジュールから `import audio_analyzer_mcp.server` された時は実行されない。
 if __name__ == "__main__":
     main()
