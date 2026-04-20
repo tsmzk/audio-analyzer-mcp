@@ -4,9 +4,11 @@ Provides tools for extracting audio features (volume, pitch, speech)
 from YouTube videos or local audio/video files using librosa.
 
 Tools:
-    analyze_youtube_audio  — Download and analyze audio from a YouTube URL
-    analyze_local_audio    — Analyze audio from a local file
-    detect_highlights      — Find volume spikes and high-energy moments (shortcut for short-form video selection)
+    analyze_youtube_audio   — Download and analyze audio from a YouTube URL
+    analyze_local_audio     — Analyze audio from a local file
+    detect_highlights       — Find volume spikes / high-energy moments from a YouTube URL
+    detect_highlights_local — Same ranking, but read from a local audio/video file
+                              (workaround when YouTube DL is blocked by bot detection)
 """
 
 # ------------------------------------------------------------------
@@ -36,11 +38,12 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from audio_analyzer_mcp.analyzer import analyze_local, analyze_youtube
 from audio_analyzer_mcp.formatters import _format_error, _format_frames
-from audio_analyzer_mcp.highlights import _detect_highlight_moments
+from audio_analyzer_mcp.highlights import build_highlight_summary
 from audio_analyzer_mcp.models import (
     AnalyzeLocalAudioInput,
     AnalyzeYouTubeAudioInput,
     DetectHighlightsInput,
+    DetectHighlightsLocalInput,
 )
 from audio_analyzer_mcp.progress import _run_with_heartbeat
 
@@ -238,27 +241,77 @@ async def detect_highlights(
 
         frames = await _run_with_heartbeat(ctx, _runner)
 
-        # ハイライト検出(スコア付き上位リストを得る)。
-        highlights = _detect_highlight_moments(
+        summary = build_highlight_summary(
             frames,
             top_n=params.top_n,
             min_gap_sec=params.min_gap_sec,
         )
-
-        # ── 動画全体のサマリー統計を作る ──
-        speech_frames = [f for f in frames if f.is_speech]
-        summary = {
-            "total_duration_sec": len(frames),              # 動画全体の長さ(秒)
-            "speech_seconds": len(speech_frames),            # 発話してた秒数
-            "silence_seconds": len(frames) - len(speech_frames),
-            # sum(1 for ... if ...) は「条件を満たす要素の数」を数える慣用句
-            "total_volume_spikes": sum(1 for f in frames if f.volume_spike),
-            "highlights": highlights,
-        }
         # indent=2 で人間が読みやすく整形。ensure_ascii=False で日本語もそのまま出力。
         return json.dumps(summary, ensure_ascii=False, indent=2)
     except Exception as exc:
         logger.error("detect_highlights failed: %s", exc, exc_info=True)
+        return _format_error(exc)
+
+
+@mcp.tool(
+    name="detect_highlights_local",
+    annotations={
+        "title": "Detect Audio Highlights (Local File)",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        # ローカルファイルを読むだけなので外部アクセスはしない。
+        "openWorldHint": False,
+    },
+)
+async def detect_highlights_local(
+    params: DetectHighlightsLocalInput,
+    ctx: Context,
+) -> str:
+    """Detect highlight moments from a LOCAL audio or video file.
+
+    Same ranking logic as detect_highlights, but reads from a local file path
+    instead of downloading from YouTube. Use this when:
+    - YouTube download is blocked (bot detection / PO Token issues)
+    - You already have a local recording (e.g., OBS capture)
+    - You want to analyze a specific local mp4/mp3
+
+    Supports audio files (wav, mp3, flac, ogg) and video files
+    (mp4, mkv, avi, mov, webm) — the audio track is automatically extracted.
+
+    Returns the same JSON structure as detect_highlights: a summary with
+    total_duration_sec / speech_seconds / silence_seconds / total_volume_spikes
+    and a `highlights` array. Each highlight includes rank, time_sec, time_hms,
+    score, reasons, rms_db, rms_norm, pitch_hz, and spectral_centroid.
+
+    Required args:
+        file_path: absolute path to the audio/video file.
+        top_n: max number of highlights to return (1-100).
+        min_gap_sec: minimum gap between highlights in seconds (1-300).
+    """
+    # ── detect_highlights とほぼ同じ形。違いは analyze_local を呼ぶことだけ。──
+    try:
+        def _runner(cb: Callable[[str, float], None]):
+            return analyze_local(
+                params.file_path,
+                sample_rate=params.sample_rate,
+                hop_length=params.hop_length,
+                frame_length=params.frame_length,
+                start_sec=params.start_sec,
+                end_sec=params.end_sec,
+                progress_cb=cb,
+            )
+
+        frames = await _run_with_heartbeat(ctx, _runner)
+
+        summary = build_highlight_summary(
+            frames,
+            top_n=params.top_n,
+            min_gap_sec=params.min_gap_sec,
+        )
+        return json.dumps(summary, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        logger.error("detect_highlights_local failed: %s", exc, exc_info=True)
         return _format_error(exc)
 
 

@@ -83,9 +83,14 @@ def _format_error(error: Exception) -> str:
         return (
             # 括弧の中で文字列リテラルを並べると自動で連結される。改行を `\n` で入れている。
             f"Download Error: {error}\n\n"
+            "This is most often caused by YouTube's bot detection (e.g. "
+            "'Sign in to confirm you're not a bot', PO Token required).\n\n"
             "Suggestions:\n"
-            "- Check the YouTube URL is correct and the video is public\n"
-            "- Ensure yt-dlp and ffmpeg are installed\n"
+            "- If you already have a local recording of this video (e.g. OBS capture), "
+            "use `detect_highlights_local` or `analyze_local_audio` instead — it skips "
+            "the YouTube download entirely.\n"
+            "- Check the YouTube URL is correct and the video is public.\n"
+            "- Ensure yt-dlp and ffmpeg are installed and on PATH.\n"
             "- Try updating yt-dlp: pip install -U yt-dlp"
         )
     elif isinstance(error, AnalysisError):

@@ -11,6 +11,7 @@ YouTube動画やローカルファイルの音声を分析し、1秒ごとの声
 | `analyze_youtube_audio` | YouTube URLから音声をDL→1秒ごとの分析データ（CSV/JSON） |
 | `analyze_local_audio` | ローカルファイル（mp4, wav等）を分析 |
 | `detect_highlights` | YouTube URLから音声のハイライト（声量スパイク、興奮ポイント）を自動検出 |
+| `detect_highlights_local` | ローカルファイルから同じロジックでハイライト抽出（YouTube bot検出の回避策） |
 
 ## 出力データの列
 
@@ -72,6 +73,31 @@ uv sync
 このYouTube動画のハイライトを検出して、字幕と突き合わせてショート候補を出して。
 URL: https://www.youtube.com/watch?v=XXXXX
 ```
+
+### ローカル録画からのハイライト抽出
+
+YouTubeのbot検出（PO Token要求など）で `detect_highlights` が失敗する場合、OBSなどで取ったローカル録画を直接解析できる:
+
+```
+次のローカル動画のハイライト上位30件を60秒間隔で出して。
+path: /Users/tsmzk/Videos/2026-xx-xx_stream.mp4
+```
+
+`detect_highlights_local` は `file_path` / `top_n` / `min_gap_sec` の3つが必須引数（デフォルトなし）。動画の長さに合わせて都度指定する。
+
+### ハイライト出力の列
+
+`detect_highlights` / `detect_highlights_local` の `highlights[]` に含まれるキー:
+
+| キー | 説明 |
+|------|------|
+| `rank` | 1始まりの順位（スコア降順） |
+| `time_sec` | 秒（int。字幕突き合わせ用） |
+| `time_hms` | `H:MM:SS` または `M:SS`。1時間超の配信でも読みやすい |
+| `timestamp` | `MM:SS`（既存フィールド。短尺向け） |
+| `score` | 複合スコア |
+| `reasons` | 加点理由のリスト（`volume_spike` / `very_loud` / `loud` / `high_pitch` / `sharp_voice`） |
+| `rms_db` / `rms_norm` / `pitch_hz` / `spectral_centroid` | そのフレームの生の特徴量 |
 
 ## 処理の流れ
 
@@ -147,6 +173,7 @@ sequenceDiagram
 
 `analyze_local_audio` はダウンロード工程をスキップし、ファイルパスを直接 `analyze_audio_file` に渡すだけ。
 `detect_highlights` は同じ解析結果を `_detect_highlight_moments` でスコアリングしてから返す。
+`detect_highlights_local` は `detect_highlights` の最初のDL工程だけを `analyze_local` に差し替えた形で、スコアリング以降のロジック（`build_highlight_summary`）を共有する。
 
 ### ステップ詳細
 
@@ -269,5 +296,14 @@ list[AudioFrame] (1秒1要素)
 ## 注意事項
 
 - 1時間の動画の分析には数分かかります（主にピッチ推定が重い）
-- yt-dlpとffmpegがPATHに必要です
+- yt-dlpとffmpegがPATHに必要です（ローカルファイル解析は yt-dlp なしでも動くが、動画からの音声抽出にはffmpegが必要）
 - YouTube動画は公開動画のみ対応
+- YouTubeのbot検出でDLが通らない場合は `detect_highlights_local` にローカル録画を渡す運用を推奨
+
+## テスト
+
+```bash
+uv run python -m unittest discover tests
+```
+
+pure-Pythonのユニットテストのみ（librosa/ffmpeg不要）。ハイライト出力の形状・順位付け・`min_gap_sec` 間引き・入力バリデーションを検証する。

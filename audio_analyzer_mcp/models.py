@@ -297,3 +297,93 @@ class DetectHighlightsInput(BaseModel):
         _validate_frame_vs_hop(self.frame_length, self.hop_length)
         _validate_time_range(self.start_sec, self.end_sec)
         return self
+
+
+# ------------------------------------------------------------------
+# ローカルファイルからのハイライト検出ツールの入力モデル
+# ------------------------------------------------------------------
+class DetectHighlightsLocalInput(BaseModel):
+    """Input for detecting highlight moments from a local audio/video file.
+
+    `detect_highlights` の YouTube ダウンロード部分を「ローカルファイル読み込み」に
+    置き換えたツールの入力。YouTube の bot 検出で DL が通らない場合の回避策として、
+    OBS などでローカル録画済みの mp4 を直接渡すことを想定している。
+
+    ポイント: `file_path` / `top_n` / `min_gap_sec` はデフォルト値を持たない必須引数。
+    動画の長さ(10分 vs 3時間)で適切な値が大きく変わるため、呼び出し側に
+    毎回意識的に指定させる意図がある。
+    """
+
+    model_config = ConfigDict(
+        str_strip_whitespace=True,
+        validate_assignment=True,
+        extra="forbid",
+    )
+
+    file_path: str = Field(
+        ...,
+        description=(
+            "Absolute path to an audio or video file. "
+            "Supported: wav, mp3, flac, ogg, mp4, mkv, avi, mov, webm."
+        ),
+        min_length=1,
+        max_length=1000,
+    )
+    top_n: int = Field(
+        ...,
+        description=(
+            "Maximum number of highlight moments to return. REQUIRED (no default) — "
+            "choose a value appropriate for the duration of the file (e.g. 10-20 "
+            "for a short clip, 30-50 for a multi-hour stream recording)."
+        ),
+        ge=1,
+        le=100,
+    )
+    min_gap_sec: int = Field(
+        ...,
+        description=(
+            "Minimum gap in seconds between reported highlights. REQUIRED (no default) — "
+            "prevents clustering of nearby spikes. Typical: 10 for short videos, "
+            "60-120 for long streams."
+        ),
+        ge=1,
+        le=300,
+    )
+    sample_rate: int = Field(
+        default=DEFAULT_SAMPLE_RATE,
+        description=(
+            f"Sample rate in Hz. Default: {DEFAULT_SAMPLE_RATE}. "
+            f"Minimum {MIN_SAMPLE_RATE}Hz (Nyquist >= pitch fmax)."
+        ),
+        ge=MIN_SAMPLE_RATE, le=44100,
+    )
+    hop_length: int = Field(
+        default=DEFAULT_HOP_LENGTH,
+        description=f"Hop length in samples. Default: {DEFAULT_HOP_LENGTH}.",
+        ge=128, le=8192,
+    )
+    frame_length: int = Field(
+        default=DEFAULT_FRAME_LENGTH,
+        description=f"Frame length in samples. Default: {DEFAULT_FRAME_LENGTH}.",
+        ge=512, le=16384,
+    )
+    start_sec: Optional[float] = Field(
+        default=None,
+        description=(
+            "Optional. Start of the analysis range in seconds. Default: from beginning."
+        ),
+        ge=0.0,
+    )
+    end_sec: Optional[float] = Field(
+        default=None,
+        description=(
+            "Optional. End of the analysis range in seconds. Default: to end of file."
+        ),
+        gt=0.0,
+    )
+
+    @model_validator(mode="after")
+    def validate_cross_fields(self) -> "DetectHighlightsLocalInput":
+        _validate_frame_vs_hop(self.frame_length, self.hop_length)
+        _validate_time_range(self.start_sec, self.end_sec)
+        return self

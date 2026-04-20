@@ -14,6 +14,24 @@ import numpy as np
 from audio_analyzer_mcp.constants import AudioFrame
 
 
+def _format_hms(time_sec: int) -> str:
+    """秒数を「時:分:秒」形式にする。1時間未満なら「分:秒」。
+
+    例: 5636 -> "1:33:56", 306 -> "5:06"
+
+    既存の AudioFrame.timestamp は "MM:SS"(分:秒)固定だが、1時間超の動画では
+    "93:56" のように分が3桁になって読みにくい。字幕との突き合わせのため、
+    必要に応じて時間単位まで表示する。
+    """
+    if time_sec < 0:
+        time_sec = 0
+    hours, rem = divmod(int(time_sec), 3600)
+    minutes, seconds = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
 def _detect_highlight_moments(
     frames: list[AudioFrame],
     top_n: int = 20,      # 返すハイライトの最大件数
@@ -97,13 +115,16 @@ def _detect_highlight_moments(
         # 0点のフレームは候補に入れない(該当理由なし)。
         if score > 0:
             # `candidates.append({...})` で辞書を1件追加。
+            # rank は後段の top_n 選抜が終わった段階で 1-indexed で付与する。
             candidates.append({
                 "timestamp": frame.timestamp,
                 "time_sec": frame.time_sec,
+                "time_hms": _format_hms(frame.time_sec),
                 "score": round(score, 1),  # round(値, 桁数) で小数点以下を丸める
                 "rms_db": frame.rms_db,
                 "rms_norm": frame.rms_norm,
                 "pitch_hz": frame.pitch_hz,
+                "spectral_centroid": frame.spectral_centroid,
                 "reasons": reasons,
             })
 
@@ -132,4 +153,37 @@ def _detect_highlight_moments(
         if len(selected) >= top_n:
             break
 
+    # ── 6. 最終順位を付与(1-indexed) ──
+    # スコア降順 + 間引き後の並びそのまま。
+    for idx, item in enumerate(selected, start=1):
+        item["rank"] = idx
+
     return selected
+
+
+def build_highlight_summary(
+    frames: list[AudioFrame],
+    *,
+    top_n: int,
+    min_gap_sec: int,
+) -> dict:
+    """フレーム列 → ハイライトサマリー dict。
+
+    `detect_highlights` (YouTube) と `detect_highlights_local` (ローカル) で
+    共通の出力形状を返すためのヘルパー。出力キーは両ツールで同一。
+    """
+    highlights = _detect_highlight_moments(
+        frames,
+        top_n=top_n,
+        min_gap_sec=min_gap_sec,
+    )
+
+    speech_frames = [f for f in frames if f.is_speech]
+    return {
+        "total_duration_sec": len(frames),
+        "speech_seconds": len(speech_frames),
+        "silence_seconds": len(frames) - len(speech_frames),
+        # sum(1 for ... if ...) は「条件を満たす要素の数」を数える慣用句
+        "total_volume_spikes": sum(1 for f in frames if f.volume_spike),
+        "highlights": highlights,
+    }
