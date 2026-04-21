@@ -55,6 +55,7 @@ from audio_analyzer_mcp.downloader import (
     ProgressCallback,
     _emit,
     download_youtube_audio,
+    transcode_to_wav,
 )
 
 logger = logging.getLogger(__name__)
@@ -545,13 +546,49 @@ def analyze_local(
     end_sec: Optional[float] = None,
     progress_cb: Optional[ProgressCallback] = None,
 ) -> list[AudioFrame]:
-    """ローカルの音声/動画ファイルを解析する。"""
-    return analyze_audio_file(
-        file_path,
-        sample_rate=sample_rate,
-        hop_length=hop_length,
-        frame_length=frame_length,
-        start_sec=start_sec,
-        end_sec=end_sec,
-        progress_cb=progress_cb,
-    )
+    """ローカルの音声/動画ファイルを解析する。
+
+    mp4/mkv/mov/webm 等は libsndfile が直接読めないため、
+    librosa.load(offset=...) が audioread (ffmpeg) フォールバックで
+    「頭からデコードして N 秒分を捨てる」動作になり、チャンク処理で
+    累積デコード量が二次関数的に膨らむ(3時間超の mp4 後半でハングする原因)。
+    そこで .wav 以外はここで ffmpeg によって mono / sample_rate の WAV に
+    事前変換し、以降のチャンク読み込みが libsndfile の O(1) シークで
+    完結するようにする。
+    """
+    path = Path(file_path)
+    if not path.exists():
+        raise AnalysisError(f"File not found: {file_path}")
+
+    # .wav は変換不要。TemporaryDirectory の生成コストを省くため早期 return。
+    # (transcode_to_wav 側でも .wav ならパススルーするが、こちらで分岐した方が
+    #  余計な一時ディレクトリを作らずに済む。)
+    if path.suffix.lower() == ".wav":
+        return analyze_audio_file(
+            file_path,
+            sample_rate=sample_rate,
+            hop_length=hop_length,
+            frame_length=frame_length,
+            start_sec=start_sec,
+            end_sec=end_sec,
+            progress_cb=progress_cb,
+        )
+
+    # 一時ディレクトリは with ブロックを抜けると自動削除されるので、
+    # analyze_audio_file の完了まで with の内側で return する必要がある。
+    with tempfile.TemporaryDirectory(prefix="audio_analyzer_local_") as tmpdir:
+        wav_path = transcode_to_wav(
+            file_path,
+            tmpdir,
+            sample_rate=sample_rate,
+            progress_cb=progress_cb,
+        )
+        return analyze_audio_file(
+            wav_path,
+            sample_rate=sample_rate,
+            hop_length=hop_length,
+            frame_length=frame_length,
+            start_sec=start_sec,
+            end_sec=end_sec,
+            progress_cb=progress_cb,
+        )

@@ -141,6 +141,87 @@ def _probe_youtube_duration(youtube_url: str) -> Optional[int]:
         return None
 
 
+def transcode_to_wav(
+    input_path: str,
+    output_dir: str,
+    *,
+    sample_rate: int = SAMPLE_RATE,
+    progress_cb: Optional[ProgressCallback] = None,
+) -> str:
+    """任意の音声/動画ファイルを mono / sample_rate の WAV に変換して返す。
+
+    ffmpeg が libsndfile 非対応な mp4 等を事前に WAV 化することで、
+    librosa.load(offset=...) が audioread フォールバックで線形デコードに陥るのを防ぐ。
+    既に .wav の場合は変換せず input_path をそのまま返す(早期 return)。
+
+    Args:
+        input_path : 変換元のローカルファイルパス(相対/絶対どちらも可)。
+        output_dir : 変換後の WAV を置くディレクトリ(呼び出し側が用意した一時領域想定)。
+        sample_rate: 出力 WAV のサンプリングレート(Hz)。
+        progress_cb: 進捗コールバック。変換開始/終了の 2 点で発火する。
+
+    Returns:
+        変換後の WAV ファイルの絶対パス(.wav 入力時は input_path をそのまま返す)。
+
+    Raises:
+        DownloadError: ffmpeg 不在、入力ファイル不在、ffmpeg 失敗、タイムアウト時。
+    """
+    # 冒頭で ffmpeg の存在を確認(見つからなければ DownloadError)。
+    _check_ffmpeg()
+
+    src = Path(input_path)
+    suffix = src.suffix.lower()
+
+    # 既に libsndfile がシークできる .wav ならパススルー。
+    # TemporaryDirectory 作成コストも呼び出し側で避けたいので、ここでも早期 return する。
+    if suffix == ".wav":
+        return str(src)
+
+    if not src.exists():
+        raise DownloadError(f"Input file not found: {input_path}")
+
+    # 出力先は「元ファイルの stem + .wav」を基本に。stem が空 (例: ".mp4") のような
+    # 変則ケースに備えて、fallback として固定名 "transcoded.wav" に切り替える。
+    stem = src.stem or "transcoded"
+    wav_path = Path(output_dir) / f"{stem}.wav"
+
+    logger.info("Transcoding %s → WAV (%s)", suffix, wav_path)
+    _emit(progress_cb, f"Transcoding {suffix} → WAV", 0.05)
+
+    # -vn は「映像ストリームを無視」。mp4/mkv/mov 等の動画入力で無駄なデコードを避ける。
+    # 音声のみの入力でも -vn は害がない(映像がなければ単に無視される)。
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", str(src),
+        "-vn",
+        "-ar", str(sample_rate),
+        "-ac", "1",
+        str(wav_path),
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=DOWNLOAD_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise DownloadError(
+            f"ffmpeg transcode timed out after {DOWNLOAD_TIMEOUT_SEC} seconds"
+        ) from exc
+
+    if result.returncode != 0:
+        # stderr の末尾 500 文字を含める(全文は長大なので)。
+        raise DownloadError(
+            f"ffmpeg transcode failed:\n{result.stderr[-500:]}"
+        )
+
+    _emit(progress_cb, "Transcoded to WAV", 0.15)
+    return str(wav_path)
+
+
 def download_youtube_audio(
     youtube_url: str,
     output_dir: str,
@@ -163,7 +244,6 @@ def download_youtube_audio(
     # Pathオブジェクトは `/` 演算子でパスを連結できる(OS依存の区切り文字を自動処理)。
     # output_template は yt-dlp用テンプレート(%(ext)s は拡張子に展開される)。
     output_template = str(Path(output_dir) / "audio.%(ext)s")
-    wav_path = str(Path(output_dir) / "audio.wav")
 
     _emit(progress_cb, "Probing video metadata...", 0.02)
 
@@ -225,21 +305,26 @@ def download_youtube_audio(
     # .suffix はファイルの拡張子(例: ".m4a")。小文字化して比較。
     if actual_path.suffix.lower() != ".wav":
         logger.info("Converting %s → WAV...", actual_path.suffix)
+        # 従来の YouTube 経路の進捗メッセージ/値(0.17)を維持するため、
+        # ここで 1 回 emit してから transcode_to_wav 内部の進捗通知は抑制する
+        # (progress_cb=None で渡す)。こうすることで呼び出し側から見た
+        # 進捗遷移は旧実装と完全に同じになる。
         _emit(progress_cb, f"Converting {actual_path.suffix} → WAV", 0.17)
 
-        convert_cmd = [
-            "ffmpeg", "-y", "-i", str(actual_path),  # -y: 既存ファイルを上書き
-            "-ar", str(SAMPLE_RATE),  # サンプリングレート指定
-            "-ac", "1",                # モノラル1chに変換(ステレオの片方は不要)
-            wav_path,
-        ]
-        conv_result = subprocess.run(convert_cmd, capture_output=True, text=True)
-        if conv_result.returncode != 0:
-            raise DownloadError(f"ffmpeg conversion failed:\n{conv_result.stderr[-500:]}")
+        # transcode_to_wav は stem + ".wav" を出力名に使うため、
+        # ダウンローダが期待する "audio.wav" と一致する(yt-dlp は "audio.<ext>"
+        # で落としてくるので stem は常に "audio")。挙動は従来と同じ。
+        converted = transcode_to_wav(
+            str(actual_path),
+            output_dir,
+            sample_rate=SAMPLE_RATE,
+            progress_cb=None,
+        )
 
         # 元の(非WAV)ファイルは削除してディスクを空ける。
+        # transcode_to_wav 側では削除しない契約なので、ここで従来通り unlink する。
         actual_path.unlink()
-        return wav_path
+        return converted
 
     # 既にWAVだった場合はそのままパスを返す。
     return str(actual_path)
