@@ -17,7 +17,12 @@ High-level entry points:
 
 from __future__ import annotations
 
+# concurrent.futures: スレッド/プロセスベースの並列実行を共通インターフェースで提供する標準ライブラリ。
+# ここではチャンク単位で別プロセスを立てて pyin を並走させるために ProcessPoolExecutor を使う。
+import concurrent.futures
 import logging
+# os: CPU 数取得 (os.cpu_count) のために使う。
+import os
 # tempfile: 一時ディレクトリ/ファイルを作る標準ライブラリ。
 # YouTubeから落としたWAVファイルを一時置き場に置き、解析後に自動削除する。
 import tempfile
@@ -44,6 +49,8 @@ from audio_analyzer_mcp.constants import (
     FRAME_LENGTH,
     HOP_LENGTH,
     NYQUIST_SAFETY,
+    PARALLEL_WORKERS,
+    PARALLEL_WORKERS_CAP,
     PITCH_FMAX_HZ,
     PITCH_FMIN_HZ,
     SAMPLE_RATE,
@@ -338,6 +345,56 @@ def _load_segment(
     return y, sr
 
 
+def _load_and_analyze_chunk(
+    path_str: str,
+    sample_rate: int,
+    hop_length: int,
+    frame_length: int,
+    seg_start: float,
+    seg_duration: float,
+    time_offset_sec: int,
+) -> list[AudioFrame]:
+    """単一チャンクを「ロード→特徴量抽出」までやって AudioFrame リストを返す。
+
+    ProcessPoolExecutor から呼ばれる前提で、すべての引数は picklable な単純型に
+    限定している(Path や ProgressCallback は渡せない)。チャンク内の進捗通知は
+    親プロセスでチャンク完了単位で発火させるため、ここでは progress_cb=None。
+
+    モジュールトップレベル関数として定義しているのは、macOS デフォルトの
+    `spawn` 起動方式で worker から import 可能である必要があるため。
+    """
+    y, sr = _load_segment(
+        Path(path_str),
+        sample_rate=sample_rate,
+        offset_sec=seg_start,
+        duration_sec=seg_duration,
+    )
+    return _analyze_waveform(
+        y,
+        sr,
+        hop_length=hop_length,
+        frame_length=frame_length,
+        time_offset_sec=time_offset_sec,
+        progress_cb=None,
+    )
+
+
+def _resolve_parallel_workers(n_chunks: int) -> int:
+    """このリクエストで実際に使うワーカー数を決定する。
+
+    - PARALLEL_WORKERS=1 なら強制逐次(並列を完全に無効化)
+    - PARALLEL_WORKERS<=0 なら CPU 数に合わせて自動(上限 PARALLEL_WORKERS_CAP)
+    - チャンク数が少ない場合はワーカー数もそれに合わせて切り詰める(無駄なプロセスを起動しない)
+    """
+    if PARALLEL_WORKERS == 1:
+        return 1
+    if PARALLEL_WORKERS > 1:
+        configured = PARALLEL_WORKERS
+    else:
+        configured = min(os.cpu_count() or 1, PARALLEL_WORKERS_CAP)
+    return max(1, min(configured, n_chunks))
+
+
 def analyze_audio_file(
     file_path: str,
     *,
@@ -426,22 +483,36 @@ def analyze_audio_file(
     merged: dict[int, AudioFrame] = {}
 
     stride = max(1, CHUNK_DURATION_SEC - CHUNK_OVERLAP_SEC)
-    # 何チャンクできるか(進捗表示用、端数は切り上げ)。
-    n_chunks = max(1, int(np.ceil((effective_duration - CHUNK_OVERLAP_SEC) / stride)))
-    if n_chunks < 1:
-        n_chunks = 1
+
+    # ── チャンクスペックを先に組み立てる ──
+    # 並列実行に投げるためには、開始秒/長さ/インデックスを事前に決定しておく必要がある。
+    # 各タプル: (chunk_idx, seg_start, seg_duration)
+    chunk_specs: list[tuple[int, float, float]] = []
+    seg_start = effective_start
+    while seg_start < effective_end:
+        seg_duration = min(float(CHUNK_DURATION_SEC), effective_end - seg_start)
+        chunk_specs.append((len(chunk_specs), float(seg_start), seg_duration))
+        if seg_start + seg_duration >= effective_end - 1e-6:
+            break
+        seg_start += stride
+
+    n_chunks = max(1, len(chunk_specs))
+    workers = _resolve_parallel_workers(n_chunks)
 
     logger.info(
-        "Chunked analysis: duration=%.1fs, chunks=%d (chunk=%ds, overlap=%ds)",
+        "Chunked analysis: duration=%.1fs, chunks=%d, workers=%d "
+        "(chunk=%ds, overlap=%ds)",
         effective_duration,
         n_chunks,
+        workers,
         CHUNK_DURATION_SEC,
         CHUNK_OVERLAP_SEC,
     )
     _emit(
         progress_cb,
         f"Long audio detected — splitting into {n_chunks} chunks of "
-        f"{CHUNK_DURATION_SEC // 60} min (overlap {CHUNK_OVERLAP_SEC}s)",
+        f"{CHUNK_DURATION_SEC // 60} min "
+        f"(overlap {CHUNK_OVERLAP_SEC}s, parallel workers={workers})",
         0.24,
     )
 
@@ -449,58 +520,104 @@ def analyze_audio_file(
     p_start_global = 0.25
     p_end_global = 0.97
 
-    chunk_idx = 0
-    seg_start = effective_start
-    while seg_start < effective_end:
-        seg_duration = min(float(CHUNK_DURATION_SEC), effective_end - seg_start)
-        chunk_label = f"{chunk_idx + 1}/{n_chunks}"
+    # チャンク完了結果を idx をキーにして保持。
+    # 並列実行では完了順がバラバラなので、最後にまとめて idx 順マージする
+    # (= 既存の「先勝ち」セマンティクスを完全に保つ)。
+    chunk_results: dict[int, list[AudioFrame]] = {}
 
-        # このチャンクに割り当てる進捗区間
-        lo = p_start_global + (p_end_global - p_start_global) * (chunk_idx / max(n_chunks, 1))
-        hi = p_start_global + (p_end_global - p_start_global) * ((chunk_idx + 1) / max(n_chunks, 1))
+    if workers <= 1:
+        # ── 逐次パス: 並列を無効化された場合の従来動作 ──
+        # チャンク内進捗(_analyze_waveform 側の per-second emit)もそのまま使う。
+        for idx, seg_start_v, seg_duration_v in chunk_specs:
+            chunk_label = f"{idx + 1}/{n_chunks}"
+            lo = p_start_global + (p_end_global - p_start_global) * (idx / n_chunks)
+            hi = p_start_global + (p_end_global - p_start_global) * ((idx + 1) / n_chunks)
 
+            _emit(
+                progress_cb,
+                f"Loading chunk {chunk_label} ({int(seg_start_v)}s–"
+                f"{int(seg_start_v + seg_duration_v)}s)",
+                lo,
+            )
+            y, sr = _load_segment(
+                path,
+                sample_rate=sample_rate,
+                offset_sec=seg_start_v,
+                duration_sec=seg_duration_v,
+            )
+            chunk_results[idx] = _analyze_waveform(
+                y,
+                sr,
+                hop_length=hop_length,
+                frame_length=frame_length,
+                time_offset_sec=int(seg_start_v),
+                progress_cb=progress_cb,
+                progress_span=(lo, hi),
+                chunk_label=chunk_label,
+            )
+    else:
+        # ── 並列パス: ProcessPoolExecutor で N チャンクを同時処理 ──
+        # 各 worker は _load_and_analyze_chunk を呼んで AudioFrame リストを返す。
+        # 進捗は「チャンク完了ごと」に粒度を落として通知する(per-second 進捗は
+        # プロセス境界を越えられないため)。
         _emit(
             progress_cb,
-            f"Loading chunk {chunk_label} ({int(seg_start)}s–"
-            f"{int(seg_start + seg_duration)}s)",
-            lo,
-        )
-        y, sr = _load_segment(
-            path,
-            sample_rate=sample_rate,
-            offset_sec=seg_start,
-            duration_sec=seg_duration,
+            f"Submitting {n_chunks} chunks to {workers} parallel workers...",
+            p_start_global,
         )
 
-        chunk_frames = _analyze_waveform(
-            y,
-            sr,
-            hop_length=hop_length,
-            frame_length=frame_length,
-            time_offset_sec=int(seg_start),
-            progress_cb=progress_cb,
-            progress_span=(lo, hi),
-            chunk_label=chunk_label,
-        )
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+            future_to_spec = {
+                pool.submit(
+                    _load_and_analyze_chunk,
+                    str(path),
+                    sample_rate,
+                    hop_length,
+                    frame_length,
+                    seg_start_v,
+                    seg_duration_v,
+                    int(seg_start_v),
+                ): (idx, seg_start_v, seg_duration_v)
+                for idx, seg_start_v, seg_duration_v in chunk_specs
+            }
 
-        # 「先勝ち」でマージ → オーバーラップ領域は前チャンクの値が残る。
-        for f in chunk_frames:
+            completed = 0
+            for fut in concurrent.futures.as_completed(future_to_spec):
+                idx, seg_start_v, seg_duration_v = future_to_spec[fut]
+                # 例外は ProcessPoolExecutor 経由で透過的に再送出される。
+                # ここで catch せずに伝播させ、analyze_audio_file 全体の
+                # 既存エラー経路(server.py 側の _format_error)に乗せる。
+                chunk_results[idx] = fut.result()
+                completed += 1
+                frac = p_start_global + (p_end_global - p_start_global) * (completed / n_chunks)
+                _emit(
+                    progress_cb,
+                    f"Completed chunk {idx + 1}/{n_chunks} "
+                    f"({int(seg_start_v)}s–{int(seg_start_v + seg_duration_v)}s) "
+                    f"[{completed}/{n_chunks} done]",
+                    frac,
+                )
+
+    # ── idx 昇順でマージ(「先勝ち」を維持) ──
+    # 並列モードでも逐次モードでも、ここの順序は idx に揃えるのでセマンティクス同一。
+    for idx in sorted(chunk_results):
+        for f in chunk_results[idx]:
             if f.time_sec not in merged:
                 merged[f.time_sec] = f
-
-        chunk_idx += 1
-        if seg_start + seg_duration >= effective_end - 1e-6:
-            break
-        seg_start += stride
 
     # 並べ替えて返す。rms_norm は全体で再計算。
     sorted_frames = [merged[t] for t in sorted(merged.keys())]
     _recompute_rms_norm(sorted_frames)
 
-    logger.info("Chunked analysis complete: %d frames from %d chunks", len(sorted_frames), chunk_idx)
+    logger.info(
+        "Chunked analysis complete: %d frames from %d chunks (workers=%d)",
+        len(sorted_frames),
+        n_chunks,
+        workers,
+    )
     _emit(
         progress_cb,
-        f"Analysis complete: {len(sorted_frames)} frames from {chunk_idx} chunks",
+        f"Analysis complete: {len(sorted_frames)} frames from {n_chunks} chunks",
         1.0,
     )
     return sorted_frames
